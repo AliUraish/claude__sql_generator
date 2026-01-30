@@ -1,0 +1,6 @@
+
+{
+  "name": "agentbasis test app 2",
+  "description": "An intelligent database designer that generates and deploys SQL schemas with one tap.",
+  "requestFramePermissions": []
+}
