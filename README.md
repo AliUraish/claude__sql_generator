@@ -79,9 +79,7 @@ The frontend will run at `http://localhost:3000`
 │   ├── src/claude_db_agent/
 │   │   ├── api.py              # FastAPI application
 │   │   ├── api_models.py       # Request/response models
-│   │   ├── claude_client.py    # Claude API client
 │   │   ├── supabase_api.py     # Supabase Management API client
-│   │   └── cli.py              # Legacy CLI interface
 │   ├── requirements.txt
 │   ├── .env                    # Backend config (gitignored)
 │   └── run_api.sh              # Start script

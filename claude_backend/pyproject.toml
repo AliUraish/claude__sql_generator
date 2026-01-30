@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "claude-db-agent"
 version = "0.1.0"
-description = "Terminal-only Python CLI that uses Claude to generate database schemas and optionally creates them in Supabase"
+description = "FastAPI backend for Claude-powered database schema generation"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
@@ -15,9 +15,6 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pydantic>=2.5.0",
 ]
-
-[project.scripts]
-claude-db-agent = "claude_db_agent.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
