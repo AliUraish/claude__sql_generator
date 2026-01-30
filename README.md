@@ -109,31 +109,6 @@ Once the backend is running, visit:
 - Interactive API docs: http://localhost:8005/docs
 - Alternative docs: http://localhost:8005/redoc
 
-## Security Notes
-
-⚠️ **IMPORTANT**: Never commit `.env` files with real credentials to version control.
-- Both backend and frontend `.env` files are in `.gitignore`
-- Always use `.env.example` files as templates
-- Keep your API keys and tokens secure
-
-## Troubleshooting
-
-### Backend won't start
-- Ensure Python 3.9+ is installed
-- Check that `ANTHROPIC_API_KEY` is set in `.env`
-- Verify all dependencies are installed: `pip install -r requirements.txt`
-
-### Frontend can't connect to backend
-- Ensure backend is running at `http://localhost:8005`
-- Check `VITE_BACKEND_URL` in frontend `.env`
-- Check browser console for CORS errors
-
-### SQL execution fails
-- Verify your Supabase project reference ID is correct
-- Ensure your Personal Access Token has the required permissions
-- Check the SQL syntax is valid PostgreSQL
-
-## Development
 
 ### Backend
 ```bash
@@ -148,6 +123,4 @@ cd agentbasis-test-app-2
 npm run dev
 ```
 
-## License
 
-MIT
