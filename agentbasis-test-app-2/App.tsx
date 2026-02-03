@@ -567,7 +567,7 @@ const App: React.FC = () => {
             {/* Chat History Button - Green Glowing Clock Icon */}
             <button
               onClick={() => setShowChatHistory(!showChatHistory)}
-              className="flex-shrink-0 p-2.5 rounded-xl bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20 hover:border-emerald-500/40 transition-all shadow-lg hover:shadow-emerald-500/20"
+              className="flex-shrink-0 p-2.5 rounded-xl bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20 hover:border-emerald-500/40 transition-all shadow-lg hover:shadow-emerald-500/20 mobile-no-anim"
               style={{
                 boxShadow: '0 0 15px rgba(16, 185, 129, 0.3), 0 0 30px rgba(16, 185, 129, 0.1)',
                 animation: 'pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite'
