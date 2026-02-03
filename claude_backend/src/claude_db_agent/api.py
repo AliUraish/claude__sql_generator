@@ -90,6 +90,12 @@ app.add_middleware(
 )
 
 
+@app.get("/health")
+def health() -> dict:
+    """Simple health check endpoint."""
+    return {"status": "ok"}
+
+
 def extract_sql_blocks(text: str) -> str:
     """Extract SQL from markdown code blocks (handles complete and incomplete blocks)."""
     # Try to find complete SQL block first
