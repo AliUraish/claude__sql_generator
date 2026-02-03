@@ -1,6 +1,7 @@
 import { Message, SupabaseConfig, ExecutionResult, Chat, ToolStatus, ContextUsage } from '../types';
 
-const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8005';
+const DEFAULT_BACKEND_URL = 'http://localhost:8005';
+export const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL || DEFAULT_BACKEND_URL).trim();
 
 export interface SSEEvent {
   event: 'delta' | 'sql' | 'done' | 'error' | 'tool' | 'context' | 'chat_rollover';

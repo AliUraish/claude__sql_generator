@@ -1,7 +1,7 @@
 
 import React, { useState, useRef, useEffect } from 'react';
 import { useUser, useAuth, SignInButton, UserButton } from '@clerk/clerk-react';
-import { BackendService } from './services/backendService';
+import { BackendService, BACKEND_URL } from './services/backendService';
 import { Message, SupabaseConfig, ExecutionResult, Chat, ToolStatus, ContextUsage } from './types';
 import Settings from './components/Settings';
 import SqlEditor from './components/SqlEditor';
@@ -72,7 +72,7 @@ const App: React.FC = () => {
         if (!isHealthy) {
           setMessages(prev => [...prev, {
             role: 'model',
-            text: '⚠️ Cannot connect to backend server. Please ensure the backend is running at http://localhost:8005'
+            text: `⚠️ Cannot connect to backend server. Please ensure the backend is running at ${BACKEND_URL}`
           }]);
           return;
         }
