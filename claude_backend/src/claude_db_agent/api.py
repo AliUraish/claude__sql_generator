@@ -3,7 +3,7 @@
 import os
 import json
 import re
-from typing import AsyncGenerator
+from typing import AsyncGenerator, List, Optional, Tuple
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Depends
@@ -18,7 +18,10 @@ from .api_models import (
     ExecuteSQLRequest, 
     ExecuteSQLResponse,
     ChatResponse,
-    ChatListResponse
+    ChatListResponse,
+    MemoryQARequest,
+    MemoryQAListResponse,
+    MemoryQAItem
 )
 from .neon_db import NeonDB
 from .clerk_auth import require_user_id
@@ -31,9 +34,9 @@ SYSTEM_INSTRUCTION = """You are a world-class database architect and SQL expert 
 Your task is to help users design and generate SQL schemas.
 
 Tool Use Policy:
-1. Only request tools when strictly necessary to complete the user's request.
-2. Prefer answering from existing context; do NOT call tools by default.
-3. Ask for clarification instead of calling tools if requirements are unclear.
+1. Prefer answering from existing context; do NOT call tools by default.
+2. Ask a single clarifying question if requirements are unclear.
+3. If confused, look for relevant memory snippets first; if not found, ask and proceed.
 
 Strict Output Format:
 1. Always provide a brief explanation of what you are building in plain text.
@@ -44,9 +47,14 @@ Strict Output Format:
 Database Rules:
 1. Always output valid PostgreSQL SQL compatible with Supabase.
 2. Adhere to PostgreSQL best practices: use snake_case, include RLS policies, foreign keys, and indexes.
-3. Default schema is 'public'. Include 'DROP TABLE IF EXISTS' for clean iterations.
-4. Use uppercase for SQL keywords.
-5. Include concise comments starting with --."""
+3. Default schema is 'public'. If generating a fresh schema, include 'DROP TABLE IF EXISTS' for clean iterations.
+4. If modifying an existing schema, output only the changed statements. Do not repeat unchanged SQL.
+5. Replacement vs ALTER:
+   - If the table being replaced exists in the current SQL script, prefer a full CREATE TABLE replacement (not ALTER).
+   - If the table is not in the current SQL script, only use ALTER if the user confirms it already exists in Supabase.
+   - If unclear, ask a short clarification question.
+6. Use uppercase for SQL keywords.
+7. Include concise comments starting with --."""
 
 
 @asynccontextmanager
@@ -139,15 +147,236 @@ def strip_sql_blocks(text: str) -> str:
     return text
 
 
+def _split_sql_statements(sql_text: str) -> List[str]:
+    """Split SQL into statements, respecting quotes, comments, and dollar-quoted blocks."""
+    statements: List[str] = []
+    buf: List[str] = []
+    i = 0
+    in_single = False
+    in_double = False
+    in_line_comment = False
+    in_block_comment = False
+    dollar_tag: Optional[str] = None
+
+    while i < len(sql_text):
+        ch = sql_text[i]
+        nxt = sql_text[i + 1] if i + 1 < len(sql_text) else ""
+
+        if in_line_comment:
+            buf.append(ch)
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+
+        if in_block_comment:
+            buf.append(ch)
+            if ch == "*" and nxt == "/":
+                buf.append(nxt)
+                i += 2
+                in_block_comment = False
+                continue
+            i += 1
+            continue
+
+        if dollar_tag:
+            if sql_text.startswith(dollar_tag, i):
+                buf.append(dollar_tag)
+                i += len(dollar_tag)
+                dollar_tag = None
+                continue
+            buf.append(ch)
+            i += 1
+            continue
+
+        if not in_single and not in_double:
+            if ch == "-" and nxt == "-":
+                in_line_comment = True
+                buf.append(ch)
+                buf.append(nxt)
+                i += 2
+                continue
+            if ch == "/" and nxt == "*":
+                in_block_comment = True
+                buf.append(ch)
+                buf.append(nxt)
+                i += 2
+                continue
+            if ch == "$":
+                end = sql_text.find("$", i + 1)
+                if end != -1:
+                    tag = sql_text[i:end + 1]
+                    if re.fullmatch(r"\$[A-Za-z_][A-Za-z0-9_]*\$", tag) or tag == "$$":
+                        dollar_tag = tag
+                        buf.append(tag)
+                        i = end + 1
+                        continue
+
+        if ch == "'" and not in_double:
+            if in_single and nxt == "'":
+                buf.append(ch)
+                buf.append(nxt)
+                i += 2
+                continue
+            in_single = not in_single
+            buf.append(ch)
+            i += 1
+            continue
+
+        if ch == '"' and not in_single:
+            if in_double and nxt == '"':
+                buf.append(ch)
+                buf.append(nxt)
+                i += 2
+                continue
+            in_double = not in_double
+            buf.append(ch)
+            i += 1
+            continue
+
+        if ch == ";" and not in_single and not in_double:
+            statement = "".join(buf).strip()
+            if statement:
+                statements.append(statement)
+            buf = []
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    tail = "".join(buf).strip()
+    if tail:
+        statements.append(tail)
+
+    return statements
+
+
+def _normalize_object_name(name: str) -> str:
+    cleaned = name.strip().strip('"')
+    parts = [part.strip().strip('"') for part in cleaned.split(".")]
+    return ".".join(part.lower() for part in parts if part)
+
+
+def _get_object_key(statement: str) -> Optional[Tuple[str, str]]:
+    patterns = [
+        ("TABLE", r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_\".]+)"),
+        ("VIEW", r"CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+([A-Za-z0-9_\".]+)"),
+        ("FUNCTION", r"CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+([A-Za-z0-9_\".]+)"),
+        ("TYPE", r"CREATE\s+TYPE\s+([A-Za-z0-9_\".]+)"),
+        ("INDEX", r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_\".]+)"),
+    ]
+    for kind, pattern in patterns:
+        match = re.search(pattern, statement, flags=re.IGNORECASE)
+        if match:
+            name = match.group(1)
+            return kind, _normalize_object_name(name)
+    return None
+
+
+def _get_drop_table_key(statement: str) -> Optional[Tuple[str, str]]:
+    match = re.search(
+        r"DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?([A-Za-z0-9_\".]+)",
+        statement,
+        flags=re.IGNORECASE
+    )
+    if not match:
+        return None
+    name = match.group(1)
+    return "TABLE", _normalize_object_name(name)
+
+
+def _get_insert_table_key(statement: str) -> Optional[Tuple[str, str]]:
+    match = re.search(
+        r"INSERT\s+INTO\s+([A-Za-z0-9_\".]+)",
+        statement,
+        flags=re.IGNORECASE
+    )
+    if not match:
+        return None
+    name = match.group(1)
+    return "TABLE", _normalize_object_name(name)
+
+
+def _get_statement_table_refs(statement: str) -> set[Tuple[str, str]]:
+    refs: set[Tuple[str, str]] = set()
+    patterns = [
+        r"INSERT\s+INTO\s+([A-Za-z0-9_\".]+)",
+        r"UPDATE\s+([A-Za-z0-9_\".]+)",
+        r"DELETE\s+FROM\s+([A-Za-z0-9_\".]+)",
+        r"ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?([A-Za-z0-9_\".]+)",
+        r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?[A-Za-z0-9_\".]+\s+ON\s+(?:ONLY\s+)?([A-Za-z0-9_\".]+)",
+        r"CREATE\s+TRIGGER\s+[A-Za-z0-9_\".]+\s+.*\s+ON\s+([A-Za-z0-9_\".]+)",
+        r"CREATE\s+POLICY\s+[A-Za-z0-9_\".]+\s+ON\s+([A-Za-z0-9_\".]+)",
+        r"COMMENT\s+ON\s+TABLE\s+([A-Za-z0-9_\".]+)",
+        r"GRANT\s+.*\s+ON\s+TABLE\s+([A-Za-z0-9_\".]+)",
+        r"REVOKE\s+.*\s+ON\s+TABLE\s+([A-Za-z0-9_\".]+)",
+        r"TRUNCATE\s+TABLE\s+(?:ONLY\s+)?([A-Za-z0-9_\".]+)",
+        r"DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?([A-Za-z0-9_\".]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, statement, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            name = match.group(1)
+            refs.add(("TABLE", _normalize_object_name(name)))
+    return refs
+
+
 def merge_sql_patch(existing_sql: str, patch_sql: str) -> str:
-    """Append patch SQL to existing SQL with a separator."""
+    """Merge patch SQL by replacing matching CREATE statements; append new ones."""
     existing = (existing_sql or "").strip()
     patch = (patch_sql or "").strip()
     if not existing:
         return patch
     if not patch:
         return existing
-    return f"{existing}\n\n-- PATCH APPLIED\n{patch}\n"
+
+    existing_statements = _split_sql_statements(existing)
+    patch_statements = _split_sql_statements(patch)
+
+    existing_index: dict[tuple[str, str], int] = {}
+    for idx, statement in enumerate(existing_statements):
+        key = _get_object_key(statement)
+        if key:
+            existing_index[key] = idx
+
+    additions: list[str] = []
+    dropped_table_keys: set[Tuple[str, str]] = set()
+    for statement in patch_statements:
+        drop_key = _get_drop_table_key(statement)
+        if drop_key:
+            removed_any = False
+            for idx, existing_stmt in enumerate(existing_statements):
+                refs = _get_statement_table_refs(existing_stmt)
+                if drop_key in refs:
+                    existing_statements[idx] = ""
+                    removed_any = True
+            dropped_table_keys.add(drop_key)
+            if not removed_any:
+                additions.append(statement)
+            continue
+        key = _get_object_key(statement)
+        if key and key in existing_index:
+            existing_statements[existing_index[key]] = statement
+        else:
+            if key and key in dropped_table_keys:
+                additions = [
+                    stmt for stmt in additions
+                    if _get_drop_table_key(stmt) != key
+                ]
+                dropped_table_keys.discard(key)
+            refs = _get_statement_table_refs(statement)
+            if refs.intersection(dropped_table_keys):
+                continue
+            additions.append(statement)
+
+    merged_statements = [stmt for stmt in existing_statements if stmt.strip()]
+    merged_statements.extend(stmt for stmt in additions if stmt.strip())
+
+    if not merged_statements:
+        return ""
+
+    return ";\n\n".join(stmt.rstrip(";").strip() for stmt in merged_statements) + ";\n"
 
 
 def should_use_memory(user_message: str) -> bool:
@@ -155,6 +384,18 @@ def should_use_memory(user_message: str) -> bool:
     if not user_message:
         return False
     trigger_pattern = r"\b(previous|earlier|before|above|last time|as i said|as i mentioned|you said|we discussed|prior)\b"
+    return re.search(trigger_pattern, user_message, re.IGNORECASE) is not None
+
+
+def should_search_memory(user_message: str) -> bool:
+    """Detect if memory lookup could resolve ambiguity or prior decisions."""
+    if not user_message:
+        return False
+    trigger_pattern = (
+        r"\b(previous|earlier|before|above|last time|as i said|as i mentioned|"
+        r"you said|we discussed|prior|replace|rename|change|modify|update|alter|"
+        r"same|similar|like before|as before)\b"
+    )
     return re.search(trigger_pattern, user_message, re.IGNORECASE) is not None
 
 
@@ -224,7 +465,7 @@ async def generate_sse_stream(request: AgentStreamRequest, user_id: str) -> Asyn
         if has_existing_sql:
             context_parts.append(
                 "IMPORTANT: An existing schema already exists. "
-                "Output ONLY the minimal SQL patch (ALTER/CREATE/DROP) needed to apply the change. "
+                "Output ONLY the minimal SQL patch needed to apply the change. "
                 "Do NOT repeat the full schema."
             )
         
@@ -232,14 +473,17 @@ async def generate_sse_stream(request: AgentStreamRequest, user_id: str) -> Asyn
         memory_context_str = ""  # String representation for context block
         memory_chunks_list = []  # List of chunks for later use
         
-        if supermemory_api_key and should_use_memory(request.message):
+        if supermemory_api_key and (should_use_memory(request.message) or should_search_memory(request.message)):
             yield f"event: tool\ndata: {json.dumps({'name': 'get_summary_memory', 'status': 'start'})}\n\n"
             try:
                 sm_client = SupermemoryClient(supermemory_api_key)
-                memory_chunks_list = await sm_client.search_chat_memory(chat_id, user_id, request.message)
+                memory_chunks_list = await sm_client.search_chat_memory(chat_id, user_id, request.message, limit=1, max_chars=3000)
                 if memory_chunks_list:
                     memory_context_str = "\n\n".join(memory_chunks_list)
                     context_parts.append(f"\nMemory (from previous conversation):\n{memory_context_str}")
+                qa_chunks = await sm_client.search_chat_qa(chat_id, user_id, query=request.message, limit=1, max_chars=2000)
+                if qa_chunks:
+                    context_parts.append(f"\nClarifications (from memory):\n{qa_chunks[0]}")
                 yield f"event: tool\ndata: {json.dumps({'name': 'get_summary_memory', 'status': 'done'})}\n\n"
             except Exception as e:
                 import traceback
@@ -535,6 +779,44 @@ async def delete_chat(chat_id: str, user_id: str = Depends(require_user_id)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete chat: {str(e)}")
+
+
+@app.post("/api/memory/qa")
+async def save_memory_qa(request: MemoryQARequest, user_id: str = Depends(require_user_id)):
+    """Save a clarification Q&A entry to Supermemory."""
+    supermemory_api_key = os.getenv("SUPERMEMORY_API_KEY")
+    if not supermemory_api_key:
+        raise HTTPException(status_code=400, detail="Supermemory not configured")
+    try:
+        sm_client = SupermemoryClient(supermemory_api_key)
+        success = await sm_client.create_chat_qa(
+            chat_id=request.chat_id,
+            user_id=user_id,
+            question=request.question,
+            answer=request.answer
+        )
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to save memory")
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save memory: {str(e)}")
+
+
+@app.get("/api/memory/qa", response_model=MemoryQAListResponse)
+async def list_memory_qa(chat_id: str, user_id: str = Depends(require_user_id)):
+    """List clarification Q&A entries for the chat."""
+    supermemory_api_key = os.getenv("SUPERMEMORY_API_KEY")
+    if not supermemory_api_key:
+        return MemoryQAListResponse(items=[])
+    try:
+        sm_client = SupermemoryClient(supermemory_api_key)
+        chunks = await sm_client.search_chat_qa(chat_id, user_id, query="Q:", limit=20, max_chars=6000)
+        items = [MemoryQAItem(content=chunk) for chunk in chunks]
+        return MemoryQAListResponse(items=items)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list memory: {str(e)}")
 
 
 @app.post("/api/agent/stream")

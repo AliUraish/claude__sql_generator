@@ -49,3 +49,20 @@ class ExecuteSQLResponse(BaseModel):
     success: bool = Field(..., description="Whether execution succeeded")
     message: str = Field(..., description="Status message")
     data: Optional[Any] = Field(default=None, description="Response data from Supabase")
+
+
+class MemoryQARequest(BaseModel):
+    """Request to save a clarification Q&A entry."""
+    chat_id: str = Field(..., description="Chat ID")
+    question: str = Field(..., description="Clarification question")
+    answer: str = Field(..., description="User answer")
+
+
+class MemoryQAItem(BaseModel):
+    """Clarification Q&A item."""
+    content: str = Field(..., description="Q&A content")
+
+
+class MemoryQAListResponse(BaseModel):
+    """List of clarification Q&A entries."""
+    items: List[MemoryQAItem]

@@ -1,4 +1,4 @@
-import { Message, SupabaseConfig, ExecutionResult, Chat, ToolStatus, ContextUsage } from '../types';
+import { Message, SupabaseConfig, ExecutionResult, Chat, ToolStatus, ContextUsage, MemoryQAItem } from '../types';
 
 const DEFAULT_BACKEND_URL = 'http://localhost:8005';
 export const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL || DEFAULT_BACKEND_URL).trim();
@@ -157,6 +157,44 @@ export class BackendService {
       const errorText = await response.text();
       throw new Error(`Failed to delete chat: ${response.status} - ${errorText}`);
     }
+  }
+
+  /**
+   * Save clarification Q&A to memory
+   */
+  static async saveMemoryQA(chatId: string, question: string, answer: string): Promise<void> {
+    const response = await fetch(`${BACKEND_URL}/api/memory/qa`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify({
+        chat_id: chatId,
+        question,
+        answer
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Failed to save memory: ${response.status} - ${errorText}`);
+    }
+  }
+
+  /**
+   * List clarification Q&A entries from memory
+   */
+  static async listMemoryQA(chatId: string): Promise<MemoryQAItem[]> {
+    const response = await fetch(`${BACKEND_URL}/api/memory/qa?chat_id=${encodeURIComponent(chatId)}`, {
+      method: 'GET',
+      headers: this.getHeaders(),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Failed to list memory: ${response.status} - ${errorText}`);
+    }
+
+    const data = await response.json();
+    return data.items || [];
   }
 
   /**

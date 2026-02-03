@@ -40,3 +40,7 @@ export interface ContextUsage {
   capChars: number;
   usagePct: number;
 }
+
+export interface MemoryQAItem {
+  content: string;
+}
