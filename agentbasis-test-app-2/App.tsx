@@ -653,13 +653,90 @@ const App: React.FC = () => {
           {/* Chat History Modal/Dropdown */}
           {showChatHistory && (
             <>
-              {/* Backdrop */}
-              <div 
-                className="fixed inset-0 bg-black/50 z-40"
+              {/* Mobile full-screen modal */}
+              <div className="fixed inset-0 z-50 flex md:hidden">
+                <div
+                  className="absolute inset-0 bg-black/70"
+                  onClick={() => setShowChatHistory(false)}
+                />
+                <div className="relative z-10 m-4 w-full rounded-2xl border border-emerald-500/20 bg-black/95 shadow-2xl flex flex-col max-h-[calc(100vh-2rem)]">
+                  <div className="p-4 border-b border-white/5 flex items-center justify-between">
+                    <h3 className="text-sm font-bold text-emerald-400 uppercase tracking-wider flex items-center space-x-2">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                      <span>Chat History</span>
+                    </h3>
+                    <button
+                      onClick={() => setShowChatHistory(false)}
+                      className="p-1 rounded-lg hover:bg-white/10 transition-colors"
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                      </svg>
+                    </button>
+                  </div>
+                  <div className="overflow-y-auto flex-1 p-2">
+                    {chats.length === 0 ? (
+                      <div className="text-center py-8 text-gray-500 text-sm">No chat history</div>
+                    ) : (
+                      <div className="space-y-1">
+                        {chats.map((chat) => (
+                          <div
+                            key={chat.id}
+                            className={`w-full text-left px-4 py-3 rounded-xl transition-all ${
+                              chat.id === currentChatId
+                                ? 'bg-emerald-500/20 border border-emerald-500/30 text-emerald-300'
+                                : 'bg-black/40 border border-white/5 hover:bg-white/5 text-gray-300'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between">
+                              <div className="flex-1 min-w-0">
+                                <button
+                                  onClick={() => {
+                                    loadChat(chat.id);
+                                    setShowChatHistory(false);
+                                  }}
+                                  className="text-sm font-medium truncate text-left w-full"
+                                >
+                                  {chat.title || `Chat ${new Date(chat.created_at).toLocaleDateString()}`}
+                                </button>
+                                <div className="text-xs text-gray-500 mt-1">
+                                  {new Date(chat.updated_at).toLocaleString()}
+                                </div>
+                              </div>
+                              <div className="flex items-center space-x-2">
+                                {chat.id === currentChatId && (
+                                  <div className="w-2 h-2 rounded-full bg-emerald-500"></div>
+                                )}
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    deleteChat(chat.id);
+                                  }}
+                                  className="p-1 rounded-lg hover:bg-red-500/20 text-red-300"
+                                  title="Delete chat"
+                                >
+                                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                                  </svg>
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Desktop dropdown */}
+              <div
+                className="fixed inset-0 bg-black/50 z-40 hidden md:block"
                 onClick={() => setShowChatHistory(false)}
               />
-              {/* Modal */}
-              <div className="absolute bottom-full left-0 right-0 mb-2 bg-black/95 border border-emerald-500/20 rounded-2xl shadow-2xl backdrop-blur-xl z-50 max-h-96 overflow-hidden flex flex-col">
+              <div className="absolute bottom-full left-0 right-0 mb-2 bg-black/95 border border-emerald-500/20 rounded-2xl shadow-2xl backdrop-blur-xl z-50 max-h-96 overflow-hidden flex flex-col hidden md:flex">
                 <div className="p-4 border-b border-white/5 flex items-center justify-between">
                   <h3 className="text-sm font-bold text-emerald-400 uppercase tracking-wider flex items-center space-x-2">
                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
