@@ -72,11 +72,13 @@ class SupermemoryClient:
         chat_id: str,
         user_id: str,
         query: str,
-        limit: int = 1
+        limit: int = 1,
+        max_chars: int = 3000,
+        memory_type: str = "chat_summary"
     ) -> List[str]:
         """
         Search for relevant memory chunks for this chat.
-        Returns list of memory/chunk strings, capped at 15k chars total.
+        Returns list of memory/chunk strings, capped at max_chars total.
         """
         if not query or not query.strip():
             return []
@@ -92,7 +94,7 @@ class SupermemoryClient:
                         "limit": limit,
                         "filters": {
                             "AND": [
-                                {"key": "type", "value": "chat_summary"},
+                                {"key": "type", "value": memory_type},
                                 {"key": "chat_id", "value": chat_id}
                             ]
                         }
@@ -109,7 +111,6 @@ class SupermemoryClient:
                 # Extract memory/chunk text and cap total length (top chunk only)
                 chunks = []
                 total_chars = 0
-                max_chars = 15000
                 
                 for result in results:
                     # Handle both string and nested dict structures
@@ -143,6 +144,63 @@ class SupermemoryClient:
             print(f"⚠️  Supermemory search error: {str(e)}")
             print(f"⚠️  Traceback: {traceback.format_exc()}")
             return []
+
+    async def create_chat_qa(
+        self,
+        chat_id: str,
+        user_id: str,
+        question: str,
+        answer: str
+    ) -> bool:
+        """Store a clarification Q&A entry in Supermemory."""
+        if not question or not answer:
+            return False
+        content = f"Q: {question.strip()}\nA: {answer.strip()}"
+        custom_id = f"chat_qa_{chat_id}_{abs(hash(content))}"
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{self.BASE_URL}/v3/documents",
+                    headers=self._get_headers(),
+                    json={
+                        "content": content,
+                        "customId": custom_id,
+                        "containerTag": user_id,
+                        "metadata": {
+                            "type": "chat_qa",
+                            "chat_id": chat_id,
+                            "question": question.strip(),
+                            "answer": answer.strip()
+                        }
+                    }
+                )
+                if response.status_code >= 400:
+                    print(f"⚠️  Supermemory QA save failed: {response.status_code} {response.text}")
+                    return False
+                return True
+        except Exception as e:
+            import traceback
+            print(f"⚠️  Supermemory QA save error: {str(e)}")
+            print(f"⚠️  Traceback: {traceback.format_exc()}")
+            return False
+
+    async def search_chat_qa(
+        self,
+        chat_id: str,
+        user_id: str,
+        query: str = "Q:",
+        limit: int = 10,
+        max_chars: int = 3000
+    ) -> List[str]:
+        """Search clarification Q&A entries for this chat."""
+        return await self.search_chat_memory(
+            chat_id=chat_id,
+            user_id=user_id,
+            query=query,
+            limit=limit,
+            max_chars=max_chars,
+            memory_type="chat_qa"
+        )
     
     def check_would_exceed_cap(self, current_summary: str, new_content: str) -> bool:
         """Check if adding new_content would exceed the cap."""
