@@ -6,9 +6,10 @@ interface SqlEditorProps {
   onExecute: () => void;
   executing: boolean;
   isGenerating: boolean;
+  className?: string;
 }
 
-const SqlEditor: React.FC<SqlEditorProps> = ({ sql, onExecute, executing, isGenerating }) => {
+const SqlEditor: React.FC<SqlEditorProps> = ({ sql, onExecute, executing, isGenerating, className }) => {
   const [copied, setCopied] = useState(false);
 
   const handleCopy = async () => {
@@ -23,7 +24,9 @@ const SqlEditor: React.FC<SqlEditorProps> = ({ sql, onExecute, executing, isGene
   };
 
   return (
-    <div className={`flex flex-col h-full bg-black/20 border-l border-white/5 transition-all duration-700 backdrop-blur-[2px] ${isGenerating ? 'ring-1 ring-emerald-500/30' : ''}`}>
+    <div
+      className={`flex flex-col h-full bg-black/20 border-l border-white/5 transition-all duration-700 backdrop-blur-[2px] ${isGenerating ? 'ring-1 ring-emerald-500/30' : ''} ${className || ''}`}
+    >
       <div className="p-4 border-b border-white/5 flex justify-between items-center glass-panel z-10">
         <h2 className="text-xs font-bold text-gray-500 uppercase tracking-[0.2em] flex items-center">
           <span className={`w-2 h-2 rounded-full mr-3 ${isGenerating ? 'bg-emerald-500 animate-pulse' : 'bg-gray-700'}`}></span>

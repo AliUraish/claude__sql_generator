@@ -2,7 +2,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useUser, useAuth, SignInButton, UserButton } from '@clerk/clerk-react';
 import { BackendService, BACKEND_URL } from './services/backendService';
-import { Message, SupabaseConfig, ExecutionResult, Chat, ToolStatus, ContextUsage, MemoryQAItem } from './types';
+import { Message, SupabaseConfig, ExecutionResult, Chat, ToolStatus, ContextUsage } from './types';
 import Settings from './components/Settings';
 import SqlEditor from './components/SqlEditor';
 import { format } from 'sql-formatter';
@@ -39,11 +39,8 @@ const App: React.FC = () => {
   // Chat history modal
   const [showChatHistory, setShowChatHistory] = useState(false);
 
-  // Memory Q&A modal
-  const [showMemory, setShowMemory] = useState(false);
-  const [memoryItems, setMemoryItems] = useState<MemoryQAItem[]>([]);
-  const [loadingMemory, setLoadingMemory] = useState(false);
-  const [memoryError, setMemoryError] = useState<string | null>(null);
+  // Mobile SQL viewer
+  const [showMobileSql, setShowMobileSql] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -278,27 +275,6 @@ const App: React.FC = () => {
     }
   };
 
-  const isClarifyingQuestion = (text: string): boolean => {
-    if (!text) return false;
-    const trimmed = text.trim();
-    if (trimmed.endsWith('?')) return true;
-    return /^clarification:|^question:/i.test(trimmed);
-  };
-
-  const loadMemory = async (chatId: string) => {
-    setLoadingMemory(true);
-    setMemoryError(null);
-    try {
-      const items = await BackendService.listMemoryQA(chatId);
-      setMemoryItems(items);
-    } catch (error: any) {
-      setMemoryError(error?.message || 'Failed to load memory.');
-      setMemoryItems([]);
-    } finally {
-      setLoadingMemory(false);
-    }
-  };
-
   const handleSendMessage = async () => {
     if (!input.trim() || isTyping) {
       console.log('Cannot send:', { input: input.trim(), isTyping });
@@ -317,18 +293,10 @@ const App: React.FC = () => {
 
     const userMessage = input;
     setInput('');
-    const lastModelMessage = [...messages].reverse().find(m => m.role === 'model' && m.text?.trim());
     setMessages(prev => [...prev, { role: 'user', text: userMessage }]);
     setIsTyping(true);
 
     try {
-      if (chatId && lastModelMessage && isClarifyingQuestion(lastModelMessage.text)) {
-        try {
-          await BackendService.saveMemoryQA(chatId, lastModelMessage.text, userMessage);
-        } catch (err) {
-          console.warn('Failed to save clarification memory:', err);
-        }
-      }
       setMessages(prev => [...prev, { role: 'model', text: '' }]);
       
       // Stream from backend (no history sent)
@@ -499,16 +467,11 @@ const App: React.FC = () => {
                 New Chat
               </button>
               <button
-                onClick={() => {
-                  if (!currentChatId) return;
-                  setShowMemory(true);
-                  loadMemory(currentChatId);
-                }}
-                className="px-3 py-2 rounded-lg bg-white/5 text-gray-300 border border-white/10 hover:bg-white/10 transition-all text-xs uppercase tracking-wider"
-                disabled={!currentChatId}
-                title="View clarification memory"
+                onClick={() => setShowMobileSql(true)}
+                className="md:hidden px-3 py-2 rounded-lg bg-white/5 text-gray-300 border border-white/10 hover:bg-white/10 transition-all text-xs uppercase tracking-wider"
+                title="View SQL output"
               >
-                Memory
+                SQL
               </button>
               <UserButton afterSignOutUrl="/" />
             </div>
@@ -781,47 +744,34 @@ const App: React.FC = () => {
           </div>
         )}
 
-        {showMemory && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
-            <div className="w-[90%] max-w-3xl rounded-3xl border border-white/10 bg-black/80 shadow-2xl">
-              <div className="flex items-center justify-between px-6 py-4 border-b border-white/10">
-                <div className="text-xs uppercase tracking-[0.3em] text-emerald-300">Clarification Memory</div>
-                <div className="flex items-center space-x-2">
-                  <button
-                    onClick={() => currentChatId && loadMemory(currentChatId)}
-                    className="px-3 py-2 rounded-lg bg-white/5 text-gray-300 border border-white/10 hover:bg-white/10 transition-all text-xs uppercase tracking-wider"
-                    disabled={!currentChatId || loadingMemory}
-                  >
-                    Refresh
-                  </button>
-                  <button
-                    onClick={() => setShowMemory(false)}
-                    className="px-3 py-2 rounded-lg bg-emerald-600/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-600/30 transition-all text-xs uppercase tracking-wider"
-                  >
-                    Close
-                  </button>
-                </div>
-              </div>
-              <div className="p-6 max-h-[60vh] overflow-y-auto space-y-4">
-                {loadingMemory && (
-                  <div className="text-sm text-gray-500">Loading memory…</div>
-                )}
-                {!loadingMemory && memoryError && (
-                  <div className="text-sm text-red-400">{memoryError}</div>
-                )}
-                {!loadingMemory && !memoryError && memoryItems.length === 0 && (
-                  <div className="text-sm text-gray-500">No clarification entries saved yet.</div>
-                )}
-                {!loadingMemory && !memoryError && memoryItems.map((item, idx) => (
-                  <div key={idx} className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                    <div className="text-sm text-gray-300 whitespace-pre-wrap">{item.content}</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        )}
       </div>
+
+      {showMobileSql && (
+        <div className="fixed inset-0 z-50 flex items-end md:hidden">
+          <div
+            className="absolute inset-0 bg-black/70 backdrop-blur-sm"
+            onClick={() => setShowMobileSql(false)}
+          />
+          <div className="relative w-full h-[85vh] rounded-t-3xl border border-white/10 bg-black/80 shadow-2xl overflow-hidden">
+            <button
+              onClick={() => setShowMobileSql(false)}
+              className="absolute top-3 right-3 z-20 p-2 rounded-xl bg-white/5 text-gray-300 border border-white/10 hover:bg-white/10 transition-all"
+              title="Close SQL viewer"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+            <SqlEditor
+              sql={sql}
+              onExecute={handleExecute}
+              executing={executing}
+              isGenerating={isTyping}
+              className="border-l-0 border-t border-white/10 rounded-t-3xl"
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 };
