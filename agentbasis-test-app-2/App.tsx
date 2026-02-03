@@ -39,8 +39,8 @@ const App: React.FC = () => {
   // Chat history modal
   const [showChatHistory, setShowChatHistory] = useState(false);
 
-  // Mobile SQL viewer
-  const [showMobileSql, setShowMobileSql] = useState(false);
+  // Mobile view toggle
+  const [mobileView, setMobileView] = useState<'chat' | 'sql'>('chat');
 
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -435,7 +435,7 @@ const App: React.FC = () => {
   return (
     <div className="flex h-screen overflow-hidden bg-transparent text-gray-300 relative z-10">
       {/* Sidebar: Interactions */}
-      <div className="flex flex-col w-full md:w-[45%] h-full border-r border-white/5 bg-black/30 backdrop-blur-md">
+      <div className="flex flex-col w-full md:w-[45%] h-full min-h-0 border-r border-white/5 bg-black/30 backdrop-blur-md">
         <div className="p-8 border-b border-white/5 flex items-center justify-between relative overflow-hidden group">
           <div className="absolute top-0 right-0 w-32 h-32 bg-emerald-500/5 blur-[60px] rounded-full -mr-10 -mt-10"></div>
           
@@ -466,23 +466,41 @@ const App: React.FC = () => {
               >
                 New Chat
               </button>
-              <button
-                onClick={() => setShowMobileSql(true)}
-                className="md:hidden px-3 py-2 rounded-lg bg-white/5 text-gray-300 border border-white/10 hover:bg-white/10 transition-all text-xs uppercase tracking-wider"
-                title="View SQL output"
-              >
-                SQL
-              </button>
               <UserButton afterSignOutUrl="/" />
             </div>
           </div>
         </div>
 
-        <div className="bg-black/20">
+        <div className="md:hidden px-8 pb-4">
+          <div className="inline-flex rounded-xl border border-white/10 bg-black/40 p-1 text-[11px] uppercase tracking-widest">
+            <button
+              onClick={() => setMobileView('chat')}
+              className={`px-4 py-2 rounded-lg transition-all ${
+                mobileView === 'chat'
+                  ? 'bg-emerald-600/30 text-emerald-200'
+                  : 'text-gray-500 hover:text-gray-300'
+              }`}
+            >
+              Chat
+            </button>
+            <button
+              onClick={() => setMobileView('sql')}
+              className={`px-4 py-2 rounded-lg transition-all ${
+                mobileView === 'sql'
+                  ? 'bg-emerald-600/30 text-emerald-200'
+                  : 'text-gray-500 hover:text-gray-300'
+              }`}
+            >
+              SQL
+            </button>
+          </div>
+        </div>
+
+        <div className={`bg-black/20 ${mobileView !== 'chat' ? 'hidden md:block' : ''}`}>
           <Settings config={supabaseConfig} setConfig={setSupabaseConfig} />
         </div>
 
-        <div className="flex-1 overflow-y-auto p-8 space-y-8 scroll-smooth" ref={scrollRef}>
+        <div className={`flex-1 min-h-0 overflow-y-auto p-8 space-y-8 scroll-smooth ${mobileView !== 'chat' ? 'hidden md:block' : ''}`} ref={scrollRef}>
           {messages.map((m, i) => (
             <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
               {/* Hide bubble if text is empty (e.g. while only SQL is being generated) */}
@@ -519,7 +537,19 @@ const App: React.FC = () => {
           )}
         </div>
 
-        <div className="p-6 border-t border-white/5 bg-black/40 backdrop-blur-xl">
+        {mobileView === 'sql' && (
+          <div className="md:hidden flex-1 min-h-0 border-t border-white/5 bg-black/20">
+            <SqlEditor
+              sql={sql}
+              onExecute={handleExecute}
+              executing={executing}
+              isGenerating={isTyping}
+              className="border-l-0"
+            />
+          </div>
+        )}
+
+        <div className={`p-6 border-t border-white/5 bg-black/40 backdrop-blur-xl ${mobileView !== 'chat' ? 'hidden md:block' : ''}`}>
           {/* Context Usage Indicator (green line under input) */}
           <div className="mb-3">
             <div 
@@ -746,32 +776,6 @@ const App: React.FC = () => {
 
       </div>
 
-      {showMobileSql && (
-        <div className="fixed inset-0 z-50 flex items-end md:hidden">
-          <div
-            className="absolute inset-0 bg-black/70 backdrop-blur-sm"
-            onClick={() => setShowMobileSql(false)}
-          />
-          <div className="relative w-full h-[85vh] rounded-t-3xl border border-white/10 bg-black/80 shadow-2xl overflow-hidden">
-            <button
-              onClick={() => setShowMobileSql(false)}
-              className="absolute top-3 right-3 z-20 p-2 rounded-xl bg-white/5 text-gray-300 border border-white/10 hover:bg-white/10 transition-all"
-              title="Close SQL viewer"
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
-              </svg>
-            </button>
-            <SqlEditor
-              sql={sql}
-              onExecute={handleExecute}
-              executing={executing}
-              isGenerating={isTyping}
-              className="border-l-0 border-t border-white/10 rounded-t-3xl"
-            />
-          </div>
-        </div>
-      )}
     </div>
   );
 };
