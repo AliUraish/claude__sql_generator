@@ -30,6 +30,7 @@ from .api_models import (
 )
 from .neon_db import NeonDB
 from .clerk_auth import require_user_id
+from .tools_config import get_tool_definitions
 
 # Load environment variables
 load_dotenv()
@@ -60,9 +61,12 @@ SYSTEM_INSTRUCTION = """You are a world-class database architect and SQL expert 
 Your task is to help users design and generate SQL schemas.
 
 Tool Use Policy:
-1. Prefer answering from existing context; do NOT call tools by default.
-2. Ask a single clarifying question if requirements are unclear.
-3. If confused, look for relevant memory snippets first; if not found, ask and proceed.
+1. You have access to tools that provide SQL context, conversation memory, and versioning.
+2. ALWAYS use `get_sql_context` if you need to see the current schema before making changes.
+3. Use `search_memory` or `search_clarifications` if the user references previous discussions or you need to recall prior decisions.
+4. Use `get_sql_versions` and `restore_sql_version` if the user wants to undo or revert changes.
+5. Prefer `get_sql_context` (compact) over `get_full_sql` unless you explicitly need to see every line of code.
+6. If the user's request is ambiguous, use tools to find context or ask a single clarifying question.
 
 Strict Output Format:
 1. Always provide a brief explanation of what you are building in plain text.
@@ -405,38 +409,114 @@ def merge_sql_patch(existing_sql: str, patch_sql: str) -> str:
     return ";\n\n".join(stmt.rstrip(";").strip() for stmt in merged_statements) + ";\n"
 
 
-def should_use_memory(user_message: str) -> bool:
-    """Detect if user is referencing previous context."""
-    if not user_message:
-        return False
-    trigger_pattern = r"\b(previous|earlier|before|above|last time|as i said|as i mentioned|you said|we discussed|prior)\b"
-    return re.search(trigger_pattern, user_message, re.IGNORECASE) is not None
-
-
-def should_search_memory(user_message: str) -> bool:
-    """Detect if memory lookup could resolve ambiguity or prior decisions."""
-    if not user_message:
-        return False
-    trigger_pattern = (
-        r"\b(previous|earlier|before|above|last time|as i said|as i mentioned|"
-        r"you said|we discussed|prior|replace|rename|change|modify|update|alter|"
-        r"same|similar|like before|as before)\b"
+@trace
+async def execute_tool(
+    tool_name: str,
+    tool_input: dict,
+    chat_id: str,
+    user_id: str
+) -> str:
+    """Execute a tool and return the result as a string.
+    
+    This function handles all tool calls from Claude's tool_use blocks.
+    """
+    from .sql_tools import (
+        get_compact_sql_context,
+        get_full_sql,
+        get_sql_versions,
+        restore_sql
     )
-    return re.search(trigger_pattern, user_message, re.IGNORECASE) is not None
-
-
-def should_use_sql_context(user_message: str) -> bool:
-    """Detect if user is asking to create/edit SQL/schema."""
-    if not user_message:
-        return False
-    sql_pattern = r"\b(sql|schema|table|column|index|constraint|rls|policy|alter|create|drop|add|remove|modify|change|update)\b"
-    return re.search(sql_pattern, user_message, re.IGNORECASE) is not None
+    from .supermemory_client import SupermemoryClient
+    import os
+    
+    supermemory_api_key = os.getenv("SUPERMEMORY_API_KEY")
+    
+    try:
+        if tool_name == "get_sql_context":
+            result = await get_compact_sql_context(chat_id)
+            return result if result else "No SQL schema defined yet for this chat."
+        
+        elif tool_name == "get_full_sql":
+            result = await get_full_sql(chat_id)
+            return result if result else "No SQL schema defined yet for this chat."
+        
+        elif tool_name == "search_memory":
+            query = tool_input.get("query", "")
+            if not query:
+                return "Error: query parameter is required for search_memory"
+            
+            if not supermemory_api_key:
+                return "Memory search unavailable: Supermemory not configured."
+            
+            sm_client = SupermemoryClient(supermemory_api_key)
+            chunks = await sm_client.search_chat_memory(
+                chat_id, user_id, query, limit=3, max_chars=4000
+            )
+            
+            if chunks:
+                return "\n\n---\n\n".join(chunks)
+            return "No relevant memory found for this query."
+        
+        elif tool_name == "search_clarifications":
+            query = tool_input.get("query", "Q:")
+            
+            if not supermemory_api_key:
+                return "Clarification search unavailable: Supermemory not configured."
+            
+            sm_client = SupermemoryClient(supermemory_api_key)
+            chunks = await sm_client.search_chat_qa(
+                chat_id, user_id, query=query, limit=5, max_chars=3000
+            )
+            
+            if chunks:
+                return "\n\n---\n\n".join(chunks)
+            return "No clarifications saved for this chat yet."
+        
+        elif tool_name == "get_sql_versions":
+            versions = await get_sql_versions(chat_id)
+            
+            if not versions:
+                return "No SQL versions found for this chat."
+            
+            result_parts = []
+            for i, version in enumerate(versions):
+                label = "Current version" if i == 0 else f"Previous version (index {i})"
+                sql_preview = version["sql_text"][:500] + "..." if len(version["sql_text"]) > 500 else version["sql_text"]
+                result_parts.append(
+                    f"### {label}\n"
+                    f"Created: {version['created_at']}\n"
+                    f"```sql\n{sql_preview}\n```"
+                )
+            
+            return "\n\n".join(result_parts)
+        
+        elif tool_name == "restore_sql_version":
+            version_index = tool_input.get("version_index", 0)
+            
+            if version_index not in [0, 1]:
+                return "Error: version_index must be 0 or 1"
+            
+            restored_sql = await restore_sql(chat_id, version_index)
+            preview = restored_sql[:300] + "..." if len(restored_sql) > 300 else restored_sql
+            return f"Successfully restored SQL version {version_index}.\n\nRestored SQL preview:\n```sql\n{preview}\n```"
+        
+        else:
+            return f"Unknown tool: {tool_name}"
+    
+    except Exception as e:
+        import traceback
+        print(f"⚠️  Tool execution error ({tool_name}): {e}")
+        print(f"⚠️  Traceback: {traceback.format_exc()}")
+        return f"Error executing tool {tool_name}: {str(e)}"
 
 
 async def generate_sse_stream(request: AgentStreamRequest, user_id: str) -> AsyncGenerator[str, None]:
-    """Generate SSE events from Claude streaming response with tool calls and context management."""
+    """Generate SSE events from Claude streaming response with native Anthropic tool calling.
+    
+    This implementation uses Claude's native tool calling capability, allowing the model
+    to autonomously decide when to use tools like get_sql_context, search_memory, etc.
+    """
     from .sql_tools import (
-        get_compact_sql_context,
         get_latest_sql,
         save_new_sql_version,
         update_chat_timestamp,
@@ -468,9 +548,6 @@ async def generate_sse_stream(request: AgentStreamRequest, user_id: str) -> Asyn
     persisted_used = persisted_context["usedChars"] if persisted_context else 0
     persisted_cap = persisted_context["capChars"] if persisted_context else 40000
 
-    # If Supermemory is available, avoid empty-query searches (unsupported)
-    # Persisted context is updated on summary writes instead.
-
     context_data = {
         'chatId': str(chat_id),
         'usedChars': persisted_used,
@@ -480,109 +557,106 @@ async def generate_sse_stream(request: AgentStreamRequest, user_id: str) -> Asyn
     yield f"event: context\ndata: {json.dumps(context_data)}\n\n"
     
     try:
-        # Fetch latest SQL for comparison only (no tool event, not in prompt unless needed)
+        # Fetch latest SQL for comparison (used after response for merging)
         latest_sql_text = await get_latest_sql(chat_id)
-
-        # Build context block for prompt
-        context_parts = []
-        has_existing_sql = bool(latest_sql_text and latest_sql_text.strip())
-
-        # SQL context only when relevant
-        sql_context_needed = should_use_sql_context(request.message)
-        if sql_context_needed:
-            yield f"event: tool\ndata: {json.dumps({'name': 'get_compact_sql_context', 'status': 'start'})}\n\n"
-            compact_sql = await get_compact_sql_context(chat_id)
-            yield f"event: tool\ndata: {json.dumps({'name': 'get_compact_sql_context', 'status': 'done'})}\n\n"
-            context_parts.append(f"Latest SQL context (read-only, compact):\n{compact_sql}")
-        
-        if has_existing_sql:
-            context_parts.append(
-                "IMPORTANT: An existing schema already exists. "
-                "Output ONLY the minimal SQL patch needed to apply the change. "
-                "Do NOT repeat the full schema."
-            )
-        
-        # Check if Supermemory is available (optional)
-        memory_context_str = ""  # String representation for context block
-        memory_chunks_list = []  # List of chunks for later use
-        
-        if supermemory_api_key and (should_use_memory(request.message) or should_search_memory(request.message)):
-            yield f"event: tool\ndata: {json.dumps({'name': 'get_summary_memory', 'status': 'start'})}\n\n"
-            try:
-                sm_client = SupermemoryClient(supermemory_api_key)
-                memory_chunks_list = await sm_client.search_chat_memory(chat_id, user_id, request.message, limit=1, max_chars=3000)
-                if memory_chunks_list:
-                    memory_context_str = "\n\n".join(memory_chunks_list)
-                    context_parts.append(f"\nMemory (from previous conversation):\n{memory_context_str}")
-                qa_chunks = await sm_client.search_chat_qa(chat_id, user_id, query=request.message, limit=1, max_chars=2000)
-                if qa_chunks:
-                    context_parts.append(f"\nClarifications (from memory):\n{qa_chunks[0]}")
-                yield f"event: tool\ndata: {json.dumps({'name': 'get_summary_memory', 'status': 'done'})}\n\n"
-            except Exception as e:
-                import traceback
-                print(f"⚠️  Memory retrieval failed: {e}")
-                print(f"⚠️  Traceback: {traceback.format_exc()}")
-                yield f"event: tool\ndata: {json.dumps({'name': 'get_summary_memory', 'status': 'error'})}\n\n"
-        
-        # Build messages (no raw history, just context + current message)
-        context_block = "\n\n".join(context_parts)
-        user_content = f"User request: {request.message}" if not context_block else f"{context_block}\n\nUser request: {request.message}"
-        messages = [{"role": "user", "content": user_content}]
         
         # Initialize Anthropic client
         client = Anthropic(
             api_key=api_key,
-            timeout=httpx.Timeout(60.0, connect=10.0),
+            timeout=httpx.Timeout(120.0, connect=10.0),  # Longer timeout for tool loops
             max_retries=2
         )
         
-        # Stream from Claude - Using create() with stream=True so AgentBasis can trace it
-        # (AgentBasis instruments .create() but not .stream())
+        # Build initial messages - just the user message, Claude will use tools as needed
+        messages = [{"role": "user", "content": request.message}]
+        
+        # Get tool definitions
+        tools = get_tool_definitions()
+        
+        # Tool calling loop - Claude decides when to use tools
+        max_tool_rounds = 5  # Prevent infinite loops
+        tool_round = 0
         full_response = ""
-        last_sql = ""
-        last_clean_text = ""
+        memory_context_str = ""  # Track for summary updates
         
-        print(f"🤖 Making Anthropic API call with create(stream=True) for AgentBasis tracing...")
-        stream = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=8192,
-            system=SYSTEM_INSTRUCTION,
-            messages=messages,
-            temperature=0.3,
-            stream=True
-        )
-        
-        for event in stream:
-            # Extract text from content_block_delta events
-            if hasattr(event, 'type') and event.type == 'content_block_delta':
-                if hasattr(event, 'delta') and hasattr(event.delta, 'text'):
-                    text = event.delta.text
-                    full_response += text
-                    
-                    # Extract current SQL
-                    current_sql = extract_sql_blocks(full_response)
-                    
-                    # Send SQL event if it changed (SQL goes only to schema output)
-                    if current_sql and current_sql != last_sql:
-                        last_sql = current_sql
-                        yield f"event: sql\ndata: {json.dumps({'sql': current_sql})}\n\n"
-                    
-                    # Calculate cleaned text (without SQL blocks) for chat
-                    clean_text = strip_sql_blocks(full_response)
-                    
-                    # Only send text delta if cleaned text changed (ensures SQL never appears in chat)
-                    if clean_text != last_clean_text:
-                        # Calculate the actual delta of cleaned text
-                        text_delta = clean_text[len(last_clean_text):]
-                        if text_delta:  # Only send if there's new text
-                            yield f"event: delta\ndata: {json.dumps({'textDelta': text_delta, 'fullText': clean_text})}\n\n"
-                        last_clean_text = clean_text
+        while tool_round < max_tool_rounds:
+            tool_round += 1
+            print(f"🤖 Anthropic API call (round {tool_round}) with tools...")
+            
+            # Make API call with tools
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=8192,
+                system=SYSTEM_INSTRUCTION,
+                messages=messages,
+                tools=tools,
+                temperature=0.3
+            )
+            
+            # Process response content blocks
+            tool_uses = []
+            text_content = ""
+            
+            for block in response.content:
+                if block.type == "text":
+                    text_content += block.text
+                elif block.type == "tool_use":
+                    tool_uses.append(block)
+            
+            # If there's text content, stream it to the client
+            if text_content:
+                full_response += text_content
+                
+                # Extract SQL and send sql event
+                current_sql = extract_sql_blocks(full_response)
+                if current_sql:
+                    yield f"event: sql\ndata: {json.dumps({'sql': current_sql})}\n\n"
+                
+                # Send text (without SQL blocks) to chat
+                clean_text = strip_sql_blocks(full_response)
+                text_delta = strip_sql_blocks(text_content)
+                
+                if text_delta:
+                    yield f"event: delta\ndata: {json.dumps({'textDelta': text_delta, 'fullText': clean_text})}\n\n"
+            
+            # If no tool calls, we're done
+            if not tool_uses or response.stop_reason == "end_turn":
+                print(f"✅ Round {tool_round} complete, no more tool calls.")
+                break
+            
+            # Process tool calls
+            tool_results = []
+            for tool_use in tool_uses:
+                tool_name = tool_use.name
+                tool_input = tool_use.input if hasattr(tool_use, 'input') else {}
+                tool_id = tool_use.id
+                
+                # Notify frontend about tool execution
+                yield f"event: tool\ndata: {json.dumps({'name': tool_name, 'status': 'start', 'input': tool_input})}\n\n"
+                
+                # Execute the tool
+                result = await execute_tool(tool_name, tool_input, chat_id, user_id)
+                
+                # Track memory context for summary updates
+                if tool_name == "search_memory" and result and "No relevant memory" not in result:
+                    memory_context_str = result
+                
+                yield f"event: tool\ndata: {json.dumps({'name': tool_name, 'status': 'done'})}\n\n"
+                
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": result
+                })
+            
+            # Add assistant response and tool results to messages for next round
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
         
         # Send final event
         final_text = strip_sql_blocks(full_response)
         final_sql = extract_sql_blocks(full_response)
         merged_sql = merge_sql_patch(latest_sql_text, final_sql)
-        # Send merged SQL to UI to keep full schema in view
         yield f"event: done\ndata: {json.dumps({'finalText': final_text, 'finalSql': merged_sql})}\n\n"
         
         # Persist: Save new SQL version if changed
@@ -671,7 +745,10 @@ async def generate_sse_stream(request: AgentStreamRequest, user_id: str) -> Asyn
             yield f"event: context\ndata: {json.dumps(context_data)}\n\n"
         
     except Exception as e:
+        import traceback
         error_msg = str(e)
+        print(f"⚠️  Stream error: {e}")
+        print(f"⚠️  Traceback: {traceback.format_exc()}")
         yield f"event: error\ndata: {json.dumps({'message': f'Error: {error_msg}'})}\n\n"
     finally:
         # Flush AgentBasis data (important for serverless environments like Vercel)
@@ -681,6 +758,7 @@ async def generate_sse_stream(request: AgentStreamRequest, user_id: str) -> Asyn
             print(f"📤 AgentBasis flush {'succeeded' if success else 'timed out'}")
         except Exception as e:
             print(f"⚠️  AgentBasis flush failed: {e}")
+
 
 
 @app.post("/api/chats/new", response_model=ChatResponse)
