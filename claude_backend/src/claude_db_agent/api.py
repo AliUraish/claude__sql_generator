@@ -97,11 +97,6 @@ async def lifespan(app: FastAPI):
     yield
     
     # Shutdown
-    try:
-        if agentbasis_initialized:
-            agentbasis.shutdown()  # Ensure all traces are flushed
-    except Exception as e:
-        print(f"⚠️  AgentBasis shutdown failed: {e}")
     NeonDB.close_pool()
 
 
