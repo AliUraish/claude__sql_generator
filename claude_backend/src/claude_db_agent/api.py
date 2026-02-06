@@ -536,39 +536,47 @@ async def generate_sse_stream(request: AgentStreamRequest, user_id: str) -> Asyn
             max_retries=2
         )
         
-        # Stream from Claude
+        # Stream from Claude - Using create() with stream=True so AgentBasis can trace it
+        # (AgentBasis instruments .create() but not .stream())
         full_response = ""
         last_sql = ""
         last_clean_text = ""
         
-        with client.messages.stream(
+        print(f"🤖 Making Anthropic API call with create(stream=True) for AgentBasis tracing...")
+        stream = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=8192,
             system=SYSTEM_INSTRUCTION,
             messages=messages,
-            temperature=0.3
-        ) as stream:
-            for text in stream.text_stream:
-                full_response += text
-                
-                # Extract current SQL
-                current_sql = extract_sql_blocks(full_response)
-                
-                # Send SQL event if it changed (SQL goes only to schema output)
-                if current_sql and current_sql != last_sql:
-                    last_sql = current_sql
-                    yield f"event: sql\ndata: {json.dumps({'sql': current_sql})}\n\n"
-                
-                # Calculate cleaned text (without SQL blocks) for chat
-                clean_text = strip_sql_blocks(full_response)
-                
-                # Only send text delta if cleaned text changed (ensures SQL never appears in chat)
-                if clean_text != last_clean_text:
-                    # Calculate the actual delta of cleaned text
-                    text_delta = clean_text[len(last_clean_text):]
-                    if text_delta:  # Only send if there's new text
-                        yield f"event: delta\ndata: {json.dumps({'textDelta': text_delta, 'fullText': clean_text})}\n\n"
-                    last_clean_text = clean_text
+            temperature=0.3,
+            stream=True
+        )
+        
+        for event in stream:
+            # Extract text from content_block_delta events
+            if hasattr(event, 'type') and event.type == 'content_block_delta':
+                if hasattr(event, 'delta') and hasattr(event.delta, 'text'):
+                    text = event.delta.text
+                    full_response += text
+                    
+                    # Extract current SQL
+                    current_sql = extract_sql_blocks(full_response)
+                    
+                    # Send SQL event if it changed (SQL goes only to schema output)
+                    if current_sql and current_sql != last_sql:
+                        last_sql = current_sql
+                        yield f"event: sql\ndata: {json.dumps({'sql': current_sql})}\n\n"
+                    
+                    # Calculate cleaned text (without SQL blocks) for chat
+                    clean_text = strip_sql_blocks(full_response)
+                    
+                    # Only send text delta if cleaned text changed (ensures SQL never appears in chat)
+                    if clean_text != last_clean_text:
+                        # Calculate the actual delta of cleaned text
+                        text_delta = clean_text[len(last_clean_text):]
+                        if text_delta:  # Only send if there's new text
+                            yield f"event: delta\ndata: {json.dumps({'textDelta': text_delta, 'fullText': clean_text})}\n\n"
+                        last_clean_text = clean_text
         
         # Send final event
         final_text = strip_sql_blocks(full_response)
@@ -668,9 +676,11 @@ async def generate_sse_stream(request: AgentStreamRequest, user_id: str) -> Asyn
     finally:
         # Flush AgentBasis data (important for serverless environments like Vercel)
         try:
-            agentbasis.flush()
-        except Exception:
-            pass  # Silently ignore if AgentBasis is not initialized
+            print("📤 Flushing AgentBasis data...")
+            success = agentbasis.flush()
+            print(f"📤 AgentBasis flush {'succeeded' if success else 'timed out'}")
+        except Exception as e:
+            print(f"⚠️  AgentBasis flush failed: {e}")
 
 
 @app.post("/api/chats/new", response_model=ChatResponse)
