@@ -71,14 +71,20 @@ async def lifespan(app: FastAPI):
         print("⚠️  Warning: ANTHROPIC_API_KEY not set")
     
     # Initialize AgentBasis SDK for observability
-    agentbasis_api_key = os.getenv("AGENTBASIS_API_KEY")
-    agentbasis_agent_id = os.getenv("AGENTBASIS_AGENT_ID")
-    if agentbasis_api_key and agentbasis_agent_id:
-        agentbasis.init()
-        instrument_anthropic()  # Auto-instrument all Anthropic calls
-        print("✓ AgentBasis SDK initialized with Anthropic instrumentation")
-    else:
-        print("⚠️  Warning: AGENTBASIS_API_KEY or AGENTBASIS_AGENT_ID not set, tracing disabled")
+    agentbasis_initialized = False
+    try:
+        agentbasis_api_key = os.getenv("AGENTBASIS_API_KEY")
+        agentbasis_agent_id = os.getenv("AGENTBASIS_AGENT_ID")
+        if agentbasis_api_key and agentbasis_agent_id:
+            agentbasis.init()
+            instrument_anthropic()  # Auto-instrument all Anthropic calls
+            agentbasis_initialized = True
+            print("✓ AgentBasis SDK initialized with Anthropic instrumentation")
+        else:
+            print("⚠️  Warning: AGENTBASIS_API_KEY or AGENTBASIS_AGENT_ID not set, tracing disabled")
+    except Exception as e:
+        print(f"⚠️  AgentBasis initialization failed: {e}")
+        agentbasis_initialized = False
     
     # Initialize Neon DB connection pool
     database_url = os.getenv("DATABASE_URL")
@@ -91,7 +97,11 @@ async def lifespan(app: FastAPI):
     yield
     
     # Shutdown
-    agentbasis.shutdown()  # Ensure all traces are flushed
+    try:
+        if agentbasis_initialized:
+            agentbasis.shutdown()  # Ensure all traces are flushed
+    except Exception as e:
+        print(f"⚠️  AgentBasis shutdown failed: {e}")
     NeonDB.close_pool()
 
 
@@ -436,8 +446,11 @@ async def generate_sse_stream(request: AgentStreamRequest, user_id: str) -> Asyn
     from .supermemory_client import SupermemoryClient
     
     # Set AgentBasis context for per-user/session tracing
-    agentbasis.set_user_id(user_id)
-    agentbasis.set_session_id(request.chat_id)
+    try:
+        agentbasis.set_user(user_id)
+        agentbasis.set_session(request.chat_id)
+    except Exception:
+        pass  # Silently ignore if AgentBasis is not initialized
     
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
@@ -654,7 +667,10 @@ async def generate_sse_stream(request: AgentStreamRequest, user_id: str) -> Asyn
         yield f"event: error\ndata: {json.dumps({'message': f'Error: {error_msg}'})}\n\n"
     finally:
         # Flush AgentBasis data (important for serverless environments like Vercel)
-        agentbasis.flush()
+        try:
+            agentbasis.flush()
+        except Exception:
+            pass  # Silently ignore if AgentBasis is not initialized
 
 
 @app.post("/api/chats/new", response_model=ChatResponse)
