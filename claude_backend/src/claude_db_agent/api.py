@@ -34,6 +34,27 @@ from .clerk_auth import require_user_id
 # Load environment variables
 load_dotenv()
 
+# Initialize AgentBasis SDK for observability (at module level for serverless)
+try:
+    agentbasis_api_key = os.getenv("AGENTBASIS_API_KEY")
+    agentbasis_agent_id = os.getenv("AGENTBASIS_AGENT_ID")
+    
+    # Debug logging
+    print(f"🔍 AgentBasis API Key present: {bool(agentbasis_api_key)}")
+    print(f"🔍 AgentBasis Agent ID present: {bool(agentbasis_agent_id)}")
+    
+    if agentbasis_api_key and agentbasis_agent_id:
+        print("🚀 Initializing AgentBasis SDK at module level...")
+        agentbasis.init()
+        instrument_anthropic()  # Auto-instrument all Anthropic calls
+        print("✓ AgentBasis SDK initialized with Anthropic instrumentation")
+    else:
+        print("⚠️  Warning: AGENTBASIS_API_KEY or AGENTBASIS_AGENT_ID not set, tracing disabled")
+except Exception as e:
+    import traceback
+    print(f"⚠️  AgentBasis initialization failed: {e}")
+    print(f"⚠️  Traceback: {traceback.format_exc()}")
+
 # System instruction for Claude (matching frontend UX)
 SYSTEM_INSTRUCTION = """You are a world-class database architect and SQL expert specializing in Supabase (PostgreSQL).
 Your task is to help users design and generate SQL schemas.
@@ -69,30 +90,6 @@ async def lifespan(app: FastAPI):
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         print("⚠️  Warning: ANTHROPIC_API_KEY not set")
-    
-    # Initialize AgentBasis SDK for observability
-    agentbasis_initialized = False
-    try:
-        agentbasis_api_key = os.getenv("AGENTBASIS_API_KEY")
-        agentbasis_agent_id = os.getenv("AGENTBASIS_AGENT_ID")
-        
-        # Debug logging
-        print(f"🔍 AgentBasis API Key present: {bool(agentbasis_api_key)}")
-        print(f"🔍 AgentBasis Agent ID present: {bool(agentbasis_agent_id)}")
-        
-        if agentbasis_api_key and agentbasis_agent_id:
-            print("🚀 Initializing AgentBasis SDK...")
-            agentbasis.init()
-            instrument_anthropic()  # Auto-instrument all Anthropic calls
-            agentbasis_initialized = True
-            print("✓ AgentBasis SDK initialized with Anthropic instrumentation")
-        else:
-            print("⚠️  Warning: AGENTBASIS_API_KEY or AGENTBASIS_AGENT_ID not set, tracing disabled")
-    except Exception as e:
-        import traceback
-        print(f"⚠️  AgentBasis initialization failed: {e}")
-        print(f"⚠️  Traceback: {traceback.format_exc()}")
-        agentbasis_initialized = False
     
     # Initialize Neon DB connection pool
     database_url = os.getenv("DATABASE_URL")
