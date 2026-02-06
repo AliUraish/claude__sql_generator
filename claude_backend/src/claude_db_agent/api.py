@@ -75,7 +75,13 @@ async def lifespan(app: FastAPI):
     try:
         agentbasis_api_key = os.getenv("AGENTBASIS_API_KEY")
         agentbasis_agent_id = os.getenv("AGENTBASIS_AGENT_ID")
+        
+        # Debug logging
+        print(f"🔍 AgentBasis API Key present: {bool(agentbasis_api_key)}")
+        print(f"🔍 AgentBasis Agent ID present: {bool(agentbasis_agent_id)}")
+        
         if agentbasis_api_key and agentbasis_agent_id:
+            print("🚀 Initializing AgentBasis SDK...")
             agentbasis.init()
             instrument_anthropic()  # Auto-instrument all Anthropic calls
             agentbasis_initialized = True
@@ -83,7 +89,9 @@ async def lifespan(app: FastAPI):
         else:
             print("⚠️  Warning: AGENTBASIS_API_KEY or AGENTBASIS_AGENT_ID not set, tracing disabled")
     except Exception as e:
+        import traceback
         print(f"⚠️  AgentBasis initialization failed: {e}")
+        print(f"⚠️  Traceback: {traceback.format_exc()}")
         agentbasis_initialized = False
     
     # Initialize Neon DB connection pool
