@@ -13,6 +13,11 @@ from dotenv import load_dotenv
 from anthropic import Anthropic
 import httpx
 
+# AgentBasis SDK for AI agent observability
+import agentbasis
+from agentbasis import trace
+from agentbasis.llms.anthropic import instrument as instrument_anthropic
+
 from .api_models import (
     AgentStreamRequest, 
     ExecuteSQLRequest, 
@@ -65,6 +70,16 @@ async def lifespan(app: FastAPI):
     if not api_key:
         print("⚠️  Warning: ANTHROPIC_API_KEY not set")
     
+    # Initialize AgentBasis SDK for observability
+    agentbasis_api_key = os.getenv("AGENTBASIS_API_KEY")
+    agentbasis_agent_id = os.getenv("AGENTBASIS_AGENT_ID")
+    if agentbasis_api_key and agentbasis_agent_id:
+        agentbasis.init()
+        instrument_anthropic()  # Auto-instrument all Anthropic calls
+        print("✓ AgentBasis SDK initialized with Anthropic instrumentation")
+    else:
+        print("⚠️  Warning: AGENTBASIS_API_KEY or AGENTBASIS_AGENT_ID not set, tracing disabled")
+    
     # Initialize Neon DB connection pool
     database_url = os.getenv("DATABASE_URL")
     if database_url:
@@ -76,6 +91,7 @@ async def lifespan(app: FastAPI):
     yield
     
     # Shutdown
+    agentbasis.shutdown()  # Ensure all traces are flushed
     NeonDB.close_pool()
 
 
@@ -419,6 +435,10 @@ async def generate_sse_stream(request: AgentStreamRequest, user_id: str) -> Asyn
     )
     from .supermemory_client import SupermemoryClient
     
+    # Set AgentBasis context for per-user/session tracing
+    agentbasis.set_user_id(user_id)
+    agentbasis.set_session_id(request.chat_id)
+    
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         yield f"event: error\ndata: {json.dumps({'message': 'ANTHROPIC_API_KEY not configured'})}\n\n"
@@ -632,6 +652,9 @@ async def generate_sse_stream(request: AgentStreamRequest, user_id: str) -> Asyn
     except Exception as e:
         error_msg = str(e)
         yield f"event: error\ndata: {json.dumps({'message': f'Error: {error_msg}'})}\n\n"
+    finally:
+        # Flush AgentBasis data (important for serverless environments like Vercel)
+        agentbasis.flush()
 
 
 @app.post("/api/chats/new", response_model=ChatResponse)
