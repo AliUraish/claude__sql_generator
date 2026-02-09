@@ -2,8 +2,9 @@
 
 import os
 import json
-from typing import Optional
+from typing import Optional, Any, Dict
 from functools import lru_cache
+from dataclasses import dataclass
 
 import httpx
 from jose import jwt, JWTError
@@ -79,6 +80,25 @@ class ClerkAuth:
             raise HTTPException(status_code=401, detail=f"Token verification failed: {str(e)}")
 
 
+@dataclass(frozen=True)
+class AuthContext:
+    user_id: str
+    session_id: Optional[str] = None
+
+
+def _extract_session_id(payload: Dict[str, Any]) -> Optional[str]:
+    """
+    Best-effort session id extraction from a Clerk JWT payload.
+
+    Clerk's exact claim names can vary by configuration; commonly "sid" exists.
+    """
+    for key in ("sid", "session_id", "sessionId"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+    return None
+
+
 async def require_user_id(authorization: Optional[str] = Header(None)) -> str:
     """FastAPI dependency to extract and verify Clerk user ID from JWT."""
     if not authorization:
@@ -103,6 +123,36 @@ async def require_user_id(authorization: Optional[str] = Header(None)) -> str:
         raise
     except Exception as e:
         # Log the actual error for debugging
+        import traceback
+        print(f"⚠️  Auth error: {str(e)}")
+        print(f"⚠️  Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=401, detail=f"Authentication failed: {str(e)}")
+
+
+async def require_auth_context(authorization: Optional[str] = Header(None)) -> AuthContext:
+    """
+    FastAPI dependency to extract Clerk user id + session id (if present) from JWT.
+    """
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid Authorization header format")
+
+    token = authorization.split(" ", 1)[1]
+
+    try:
+        payload = await ClerkAuth.verify_token(token)
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Token missing 'sub' claim")
+
+        session_id = _extract_session_id(payload)
+        return AuthContext(user_id=user_id, session_id=session_id)
+
+    except HTTPException:
+        raise
+    except Exception as e:
         import traceback
         print(f"⚠️  Auth error: {str(e)}")
         print(f"⚠️  Traceback: {traceback.format_exc()}")
