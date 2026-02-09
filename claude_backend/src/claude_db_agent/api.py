@@ -29,11 +29,14 @@ from .api_models import (
     MemoryQAItem
 )
 from .neon_db import NeonDB
-from .clerk_auth import require_user_id
+from .clerk_auth import require_user_id, require_auth_context, AuthContext
 from .tools_config import get_tool_definitions
 
 # Load environment variables
 load_dotenv()
+
+# Tracks whether AgentBasis is successfully initialized in this process.
+AGENTBASIS_ENABLED = False
 
 # Initialize AgentBasis SDK for observability (at module level for serverless)
 try:
@@ -45,10 +48,23 @@ try:
     print(f"🔍 AgentBasis Agent ID present: {bool(agentbasis_agent_id)}")
     
     if agentbasis_api_key and agentbasis_agent_id:
-        print("🚀 Initializing AgentBasis SDK at module level...")
-        agentbasis.init()
-        instrument_anthropic()  # Auto-instrument all Anthropic calls
-        print("✓ AgentBasis SDK initialized with Anthropic instrumentation")
+        # Avoid double-init (e.g., some reload setups) and avoid double-patching Anthropic.
+        already_initialized = False
+        try:
+            agentbasis.AgentBasis.get_instance()
+            already_initialized = True
+        except Exception:
+            already_initialized = False
+
+        if already_initialized:
+            AGENTBASIS_ENABLED = True
+            print("✓ AgentBasis SDK already initialized")
+        else:
+            print("🚀 Initializing AgentBasis SDK at module level...")
+            agentbasis.init(api_key=agentbasis_api_key, agent_id=agentbasis_agent_id)
+            instrument_anthropic()  # Auto-instrument all Anthropic calls
+            AGENTBASIS_ENABLED = True
+            print("✓ AgentBasis SDK initialized with Anthropic instrumentation")
     else:
         print("⚠️  Warning: AGENTBASIS_API_KEY or AGENTBASIS_AGENT_ID not set, tracing disabled")
 except Exception as e:
@@ -510,7 +526,11 @@ async def execute_tool(
         return f"Error executing tool {tool_name}: {str(e)}"
 
 
-async def generate_sse_stream(request: AgentStreamRequest, user_id: str) -> AsyncGenerator[str, None]:
+async def generate_sse_stream(
+    request: AgentStreamRequest,
+    user_id: str,
+    session_id: Optional[str] = None,
+) -> AsyncGenerator[str, None]:
     """Generate SSE events from Claude streaming response with native Anthropic tool calling.
     
     This implementation uses Claude's native tool calling capability, allowing the model
@@ -524,11 +544,16 @@ async def generate_sse_stream(request: AgentStreamRequest, user_id: str) -> Asyn
         update_chat_context_usage
     )
     from .supermemory_client import SupermemoryClient
+    from opentelemetry import trace as otel_trace
     
     # Set AgentBasis context for per-user/session tracing
     try:
         agentbasis.set_user(user_id)
-        agentbasis.set_session(request.chat_id)
+        # "session" should be stable across multiple requests; prefer the auth session id if available.
+        agentbasis.set_session(session_id or f"chat:{request.chat_id}")
+        # "conversation" is a better match for a chat thread.
+        agentbasis.set_conversation(request.chat_id)
+        agentbasis.set_metadata({"chat_id": request.chat_id})
     except Exception:
         pass  # Silently ignore if AgentBasis is not initialized
     
@@ -556,193 +581,205 @@ async def generate_sse_stream(request: AgentStreamRequest, user_id: str) -> Asyn
     }
     yield f"event: context\ndata: {json.dumps(context_data)}\n\n"
     
+    tracer = otel_trace.get_tracer("claude_db_agent.streaming")
     try:
-        # Fetch latest SQL for comparison (used after response for merging)
-        latest_sql_text = await get_latest_sql(chat_id)
-        
-        # Initialize Anthropic client
-        client = Anthropic(
-            api_key=api_key,
-            timeout=httpx.Timeout(120.0, connect=10.0),  # Longer timeout for tool loops
-            max_retries=2
-        )
-        
-        # Build initial messages - just the user message, Claude will use tools as needed
-        messages = [{"role": "user", "content": request.message}]
-        
-        # Get tool definitions
-        tools = get_tool_definitions()
-        
-        # Tool calling loop - Claude decides when to use tools
-        max_tool_rounds = 5  # Prevent infinite loops
-        tool_round = 0
-        full_response = ""
-        memory_context_str = ""  # Track for summary updates
-        
-        while tool_round < max_tool_rounds:
-            tool_round += 1
-            print(f"🤖 Anthropic API call (round {tool_round}) with tools...")
+        # Keep a span open for the entire lifetime of the streaming generator.
+            # Without this, you mostly only see tool spans + the LLM spans.
+        with tracer.start_as_current_span("agent_stream") as stream_span:
+            stream_span.set_attribute("agentbasis.user.id", str(user_id))
+            stream_span.set_attribute(
+                "agentbasis.session.id",
+                str(session_id or f"chat:{request.chat_id}"),
+            )
+            stream_span.set_attribute("agentbasis.conversation.id", str(request.chat_id))
+            stream_span.set_attribute("chat.id", str(request.chat_id))
+
+            # Fetch latest SQL for comparison (used after response for merging)
+            latest_sql_text = await get_latest_sql(chat_id)
             
-            # Make API call with tools
-            response = client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=8192,
-                system=SYSTEM_INSTRUCTION,
-                messages=messages,
-                tools=tools,
-                temperature=0.3
+            # Initialize Anthropic client
+            client = Anthropic(
+                api_key=api_key,
+                timeout=httpx.Timeout(120.0, connect=10.0),  # Longer timeout for tool loops
+                max_retries=2
             )
             
-            # Process response content blocks
-            tool_uses = []
-            text_content = ""
+            # Build initial messages - just the user message, Claude will use tools as needed
+            messages = [{"role": "user", "content": request.message}]
             
-            for block in response.content:
-                if block.type == "text":
-                    text_content += block.text
-                elif block.type == "tool_use":
-                    tool_uses.append(block)
+            # Get tool definitions
+            tools = get_tool_definitions()
             
-            # If there's text content, stream it to the client
-            if text_content:
-                full_response += text_content
-                
-                # Extract SQL and send sql event
-                current_sql = extract_sql_blocks(full_response)
-                if current_sql:
-                    yield f"event: sql\ndata: {json.dumps({'sql': current_sql})}\n\n"
-                
-                # Send text (without SQL blocks) to chat
-                clean_text = strip_sql_blocks(full_response)
-                text_delta = strip_sql_blocks(text_content)
-                
-                if text_delta:
-                    yield f"event: delta\ndata: {json.dumps({'textDelta': text_delta, 'fullText': clean_text})}\n\n"
+            # Tool calling loop - Claude decides when to use tools
+            max_tool_rounds = 5  # Prevent infinite loops
+            tool_round = 0
+            full_response = ""
+            memory_context_str = ""  # Track for summary updates
             
-            # If no tool calls, we're done
-            if not tool_uses or response.stop_reason == "end_turn":
-                print(f"✅ Round {tool_round} complete, no more tool calls.")
-                break
-            
-            # Process tool calls
-            tool_results = []
-            for tool_use in tool_uses:
-                tool_name = tool_use.name
-                tool_input = tool_use.input if hasattr(tool_use, 'input') else {}
-                tool_id = tool_use.id
+            while tool_round < max_tool_rounds:
+                tool_round += 1
+                print(f"🤖 Anthropic API call (round {tool_round}) with tools...")
                 
-                # Notify frontend about tool execution
-                yield f"event: tool\ndata: {json.dumps({'name': tool_name, 'status': 'start', 'input': tool_input})}\n\n"
+                # Make API call with tools
+                response = client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=8192,
+                    system=SYSTEM_INSTRUCTION,
+                    messages=messages,
+                    tools=tools,
+                    temperature=0.3
+                )
                 
-                # Execute the tool
-                result = await execute_tool(tool_name, tool_input, chat_id, user_id)
+                # Process response content blocks
+                tool_uses = []
+                text_content = ""
                 
-                # Track memory context for summary updates
-                if tool_name == "search_memory" and result and "No relevant memory" not in result:
-                    memory_context_str = result
+                for block in response.content:
+                    if block.type == "text":
+                        text_content += block.text
+                    elif block.type == "tool_use":
+                        tool_uses.append(block)
                 
-                yield f"event: tool\ndata: {json.dumps({'name': tool_name, 'status': 'done'})}\n\n"
-                
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_id,
-                    "content": result
-                })
-            
-            # Add assistant response and tool results to messages for next round
-            messages.append({"role": "assistant", "content": response.content})
-            messages.append({"role": "user", "content": tool_results})
-        
-        # Send final event
-        final_text = strip_sql_blocks(full_response)
-        final_sql = extract_sql_blocks(full_response)
-        merged_sql = merge_sql_patch(latest_sql_text, final_sql)
-        yield f"event: done\ndata: {json.dumps({'finalText': final_text, 'finalSql': merged_sql})}\n\n"
-        
-        # Persist: Save new SQL version if changed
-        if final_sql and final_sql.strip() != latest_sql_text.strip():
-            await save_new_sql_version(chat_id, merged_sql)
-        
-        # Update chat timestamp
-        await update_chat_timestamp(chat_id)
-        
-        # Update Supermemory summary (best-effort)
-        if supermemory_api_key:
-            try:
-                sm_client = SupermemoryClient(supermemory_api_key)
-                # Build simple rolling summary: user message + assistant response
-                new_summary_chunk = f"User: {request.message}\nAssistant: {final_text}\n\n"
-                
-                # Use persisted usage for accurate context tracking
-                current_summary = memory_context_str if memory_context_str else ""
-                base_used = max(persisted_used, len(current_summary))
-                would_exceed = (base_used + len(new_summary_chunk)) > sm_client.CONTEXT_CAP_CHARS
-                
-                if would_exceed:
-                    # Create new chat and signal rollover
-                    new_chat = await NeonDB.execute_returning(
-                        "INSERT INTO chats (user_id, title) VALUES (%s, %s) RETURNING id",
-                        (user_id, None)
-                    )
-                    if not new_chat:
-                        raise ValueError("Failed to create new chat during rollover")
+                # If there's text content, stream it to the client
+                if text_content:
+                    full_response += text_content
                     
-                    # Convert UUID to string for JSON serialization
-                    new_chat_id = str(new_chat["id"])
+                    # Extract SQL and send sql event
+                    current_sql = extract_sql_blocks(full_response)
+                    if current_sql:
+                        yield f"event: sql\ndata: {json.dumps({'sql': current_sql})}\n\n"
                     
-                    # Insert initial empty SQL for new chat
-                    await NeonDB.execute(
-                        "INSERT INTO chat_sql_versions (chat_id, sql_text) VALUES (%s, %s)",
-                        (new_chat_id, "")
-                    )
-                    await update_chat_context_usage(new_chat_id, 0, 40000)
+                    # Send text (without SQL blocks) to chat
+                    clean_text = strip_sql_blocks(full_response)
+                    text_delta = strip_sql_blocks(text_content)
                     
-                    # Signal rollover to frontend
-                    yield f"event: chat_rollover\ndata: {json.dumps({'newChatId': new_chat_id})}\n\n"
-                else:
-                    # Update summary normally
-                    updated_summary = current_summary + new_summary_chunk
-                    new_used_chars = min(
-                        base_used + len(new_summary_chunk),
-                        sm_client.CONTEXT_CAP_CHARS
-                    )
-                    await update_chat_context_usage(
-                        chat_id,
-                        new_used_chars,
-                        sm_client.CONTEXT_CAP_CHARS
-                    )
-                    await sm_client.update_chat_summary(chat_id, user_id, updated_summary)
+                    if text_delta:
+                        yield f"event: delta\ndata: {json.dumps({'textDelta': text_delta, 'fullText': clean_text})}\n\n"
+                
+                # If no tool calls, we're done
+                if not tool_uses or response.stop_reason == "end_turn":
+                    print(f"✅ Round {tool_round} complete, no more tool calls.")
+                    break
+                
+                # Process tool calls
+                tool_results = []
+                for tool_use in tool_uses:
+                    tool_name = tool_use.name
+                    tool_input = tool_use.input if hasattr(tool_use, 'input') else {}
+                    tool_id = tool_use.id
+                    
+                    # Notify frontend about tool execution
+                    yield f"event: tool\ndata: {json.dumps({'name': tool_name, 'status': 'start', 'input': tool_input})}\n\n"
+                    
+                    # Execute the tool
+                    result = await execute_tool(tool_name, tool_input, chat_id, user_id)
+                    
+                    # Track memory context for summary updates
+                    if tool_name == "search_memory" and result and "No relevant memory" not in result:
+                        memory_context_str = result
+                    
+                    yield f"event: tool\ndata: {json.dumps({'name': tool_name, 'status': 'done'})}\n\n"
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_id,
+                        "content": result
+                    })
+                
+                # Add assistant response and tool results to messages for next round
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({"role": "user", "content": tool_results})
+            
+            # Send final event
+            final_text = strip_sql_blocks(full_response)
+            final_sql = extract_sql_blocks(full_response)
+            merged_sql = merge_sql_patch(latest_sql_text, final_sql)
+            yield f"event: done\ndata: {json.dumps({'finalText': final_text, 'finalSql': merged_sql})}\n\n"
+            
+            # Persist: Save new SQL version if changed
+            if final_sql and final_sql.strip() != latest_sql_text.strip():
+                await save_new_sql_version(chat_id, merged_sql)
+            
+            # Update chat timestamp
+            await update_chat_timestamp(chat_id)
+            
+            # Update Supermemory summary (best-effort)
+            if supermemory_api_key:
+                try:
+                    sm_client = SupermemoryClient(supermemory_api_key)
+                    # Build simple rolling summary: user message + assistant response
+                    new_summary_chunk = f"User: {request.message}\nAssistant: {final_text}\n\n"
+                    
+                    # Use persisted usage for accurate context tracking
+                    current_summary = memory_context_str if memory_context_str else ""
+                    base_used = max(persisted_used, len(current_summary))
+                    would_exceed = (base_used + len(new_summary_chunk)) > sm_client.CONTEXT_CAP_CHARS
+                    
+                    if would_exceed:
+                        # Create new chat and signal rollover
+                        new_chat = await NeonDB.execute_returning(
+                            "INSERT INTO chats (user_id, title) VALUES (%s, %s) RETURNING id",
+                            (user_id, None)
+                        )
+                        if not new_chat:
+                            raise ValueError("Failed to create new chat during rollover")
+                        
+                        # Convert UUID to string for JSON serialization
+                        new_chat_id = str(new_chat["id"])
+                        
+                        # Insert initial empty SQL for new chat
+                        await NeonDB.execute(
+                            "INSERT INTO chat_sql_versions (chat_id, sql_text) VALUES (%s, %s)",
+                            (new_chat_id, "")
+                        )
+                        await update_chat_context_usage(new_chat_id, 0, 40000)
+                        
+                        # Signal rollover to frontend
+                        yield f"event: chat_rollover\ndata: {json.dumps({'newChatId': new_chat_id})}\n\n"
+                    else:
+                        # Update summary normally
+                        updated_summary = current_summary + new_summary_chunk
+                        new_used_chars = min(
+                            base_used + len(new_summary_chunk),
+                            sm_client.CONTEXT_CAP_CHARS
+                        )
+                        await update_chat_context_usage(
+                            chat_id,
+                            new_used_chars,
+                            sm_client.CONTEXT_CAP_CHARS
+                        )
+                        await sm_client.update_chat_summary(chat_id, user_id, updated_summary)
 
-                    # Recalculate and fetch persisted context after each chat
-                    recalculated_context = await get_chat_context_usage(chat_id)
-                    if recalculated_context:
-                        context_data = {
-                            'chatId': str(chat_id),
-                            'usedChars': recalculated_context["usedChars"],
-                            'capChars': recalculated_context["capChars"],
-                            'usagePct': recalculated_context["usagePct"]
-                        }
-                        yield f"event: context\ndata: {json.dumps(context_data)}\n\n"
-            
-            except Exception as e:
-                import traceback
-                print(f"⚠️  Supermemory summary update failed: {e}")
-                print(f"⚠️  Traceback: {traceback.format_exc()}")
-                # Fallback to persisted context usage
-                fallback_context = await get_chat_context_usage(chat_id)
-                if fallback_context:
-                    yield f"event: context\ndata: {json.dumps({'chatId': str(chat_id), 'usedChars': fallback_context['usedChars'], 'capChars': fallback_context['capChars'], 'usagePct': fallback_context['usagePct']})}\n\n"
-        else:
-            # Supermemory not configured - send 0% context
-            await update_chat_context_usage(chat_id, 0, 40000)
-            recalculated_context = await get_chat_context_usage(chat_id)
-            context_data = {
-                'chatId': str(chat_id),
-                'usedChars': recalculated_context["usedChars"] if recalculated_context else 0,
-                'capChars': recalculated_context["capChars"] if recalculated_context else 40000,
-                'usagePct': recalculated_context["usagePct"] if recalculated_context else 0
-            }
-            yield f"event: context\ndata: {json.dumps(context_data)}\n\n"
+                        # Recalculate and fetch persisted context after each chat
+                        recalculated_context = await get_chat_context_usage(chat_id)
+                        if recalculated_context:
+                            context_data = {
+                                'chatId': str(chat_id),
+                                'usedChars': recalculated_context["usedChars"],
+                                'capChars': recalculated_context["capChars"],
+                                'usagePct': recalculated_context["usagePct"]
+                            }
+                            yield f"event: context\ndata: {json.dumps(context_data)}\n\n"
+                
+                except Exception as e:
+                    import traceback
+                    print(f"⚠️  Supermemory summary update failed: {e}")
+                    print(f"⚠️  Traceback: {traceback.format_exc()}")
+                    # Fallback to persisted context usage
+                    fallback_context = await get_chat_context_usage(chat_id)
+                    if fallback_context:
+                        yield f"event: context\ndata: {json.dumps({'chatId': str(chat_id), 'usedChars': fallback_context['usedChars'], 'capChars': fallback_context['capChars'], 'usagePct': fallback_context['usagePct']})}\n\n"
+            else:
+                # Supermemory not configured - send 0% context
+                await update_chat_context_usage(chat_id, 0, 40000)
+                recalculated_context = await get_chat_context_usage(chat_id)
+                context_data = {
+                    'chatId': str(chat_id),
+                    'usedChars': recalculated_context["usedChars"] if recalculated_context else 0,
+                    'capChars': recalculated_context["capChars"] if recalculated_context else 40000,
+                    'usagePct': recalculated_context["usagePct"] if recalculated_context else 0
+                }
+                yield f"event: context\ndata: {json.dumps(context_data)}\n\n"
         
     except Exception as e:
         import traceback
@@ -752,12 +789,21 @@ async def generate_sse_stream(request: AgentStreamRequest, user_id: str) -> Asyn
         yield f"event: error\ndata: {json.dumps({'message': f'Error: {error_msg}'})}\n\n"
     finally:
         # Flush AgentBasis data (important for serverless environments like Vercel)
+        if AGENTBASIS_ENABLED:
+            try:
+                print("📤 Flushing AgentBasis data...")
+                success = agentbasis.flush()
+                print(f"📤 AgentBasis flush {'succeeded' if success else 'timed out'}")
+            except Exception as e:
+                print(f"⚠️  AgentBasis flush failed: {e}")
+
+        # Best-effort cleanup (contextvars are task-local, but avoid surprises).
         try:
-            print("📤 Flushing AgentBasis data...")
-            success = agentbasis.flush()
-            print(f"📤 AgentBasis flush {'succeeded' if success else 'timed out'}")
-        except Exception as e:
-            print(f"⚠️  AgentBasis flush failed: {e}")
+            agentbasis.set_user(None)
+            agentbasis.set_session(None)
+            agentbasis.set_conversation(None)
+        except Exception:
+            pass
 
 
 
@@ -947,7 +993,7 @@ async def list_memory_qa(chat_id: str, user_id: str = Depends(require_user_id)):
 
 
 @app.post("/api/agent/stream")
-async def agent_stream(request: AgentStreamRequest, user_id: str = Depends(require_user_id)):
+async def agent_stream(request: AgentStreamRequest, auth: AuthContext = Depends(require_auth_context)):
     """
     Stream Claude responses with SSE.
     
@@ -961,7 +1007,7 @@ async def agent_stream(request: AgentStreamRequest, user_id: str = Depends(requi
     - chat_rollover: New chat created due to context cap
     """
     return StreamingResponse(
-        generate_sse_stream(request, user_id),
+        generate_sse_stream(request, auth.user_id, session_id=auth.session_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
